@@ -46,7 +46,7 @@ class PairTreeFolder(object):
         
         unfinish = True
         while unfinish:
-            for path in self.files:
+            for i, path in enumerate(self.files):
                 if path is None: mol_trees = self.mol_trees
                 else:
                     mol_trees = None

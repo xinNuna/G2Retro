@@ -82,7 +82,7 @@ def get_uniq_atoms(graphs, cliques, attach_atoms, label, avocab):
     unmatched_idxs = [i for i in range(len(cliques))]
     matched_idxs = {}
     visited_idxs = []
-    while len(unmatched_idx) > 0:
+    while len(unmatched_idxs) > 0:
         for i, idx in enumerate(unmatched_idxs[:-1]):
             for jdx in unmatched_idxs[i+1:]:
                 if adj_mat[idx] == adj_mat[jdx]:
