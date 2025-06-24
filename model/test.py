@@ -41,7 +41,7 @@ parser.add_argument("-o", "--output", dest="output")
 parser.add_argument("-st", "--start", type=int, dest="start", default=0)
 parser.add_argument("-si", "--size", type=int, dest="size", default=0)
 
-parser.add_argument("--vocab", type=str, default="../data/vocab.txt")
+parser.add_argument("--vocab", type=str, default="../data/USPTO_50K/vocab.txt")
 parser.add_argument("--ncpu", type=int, default=10)
 parser.add_argument("--decode_type", type=int, default=2)
 parser.add_argument("--seed", type=int, default=2021)

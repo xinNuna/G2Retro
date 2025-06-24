@@ -1,0 +1,7 @@
+NCN C=N.N
+CCO C.C=O,C=C.O
+C[SH]=O C.[O-]S,C.OS
+NCO C=N.O
+CP=O C.OP
+CC=N C.CN
+C=CN C#C.N

@@ -1025,7 +1025,7 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser()
     parser.add_argument("-d", "--train", type=str, default="./data/logp06/", help="the path of training data")
-    parser.add_argument("-o", "--out", type=str, default="./data/vocab.txt", help="the path of vocabulary")
+    parser.add_argument("-o", "--out", type=str, default="./data/USPTO_50K/vocab.txt", help="the path of vocabulary")
     args = parser.parse_args()
     
     cset = set()

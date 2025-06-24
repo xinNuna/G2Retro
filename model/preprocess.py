@@ -86,8 +86,8 @@ if __name__ == "__main__":
     lg.setLevel(rdkit.RDLogger.CRITICAL)
 
     parser = ArgumentParser()
-    parser.add_argument('--train', type=str, default="../data/train.csv", help="specify the name of file with training data to be processed")
-    parser.add_argument('--path', type=str, default="../data/", help="specify the name of file with training data to be processed")
+    parser.add_argument('--train', type=str, default="../data/USPTO_50K/train.csv", help="specify the name of file with training data to be processed")
+    parser.add_argument('--path', type=str, default="../data/USPTO_50K/", help="specify the name of file with training data to be processed")
     parser.add_argument('--output', type=str, default="tensors", help="specify the name of processed dataset.")
     parser.add_argument('--use_bfs', action="store_true")
     parser.add_argument('--shuffle', action="store_true")

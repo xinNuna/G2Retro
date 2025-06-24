@@ -20,10 +20,10 @@ path = os.path.dirname(os.path.realpath(__file__))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--train', type=str, default="../data/dfs_tensors_with_class.pkl", help='data path to training data')
-    parser.add_argument('--valid', type=str, default="../data/valid.csv", help='data path to validation data')
+    parser.add_argument('--train', type=str, default="../data/USPTO_50K/dfs_tensors_with_class.pkl", help='data path to training data')
+    parser.add_argument('--valid', type=str, default="../data/USPTO_50K/valid.csv", help='data path to validation data')
     
-    parser.add_argument('--vocab', type=str, default="../data/vocab.txt", help='data path to substructure vocabulary')
+    parser.add_argument('--vocab', type=str, default="../data/USPTO_50K/vocab.txt", help='data path to substructure vocabulary')
     parser.add_argument('--save_dir', type=str, default="../result/", help='data path to the directory used to save trained models')
     parser.add_argument('--load_epoch', type=int, default=0, help='an interger used to control the loaded model (i.e., if load_epoch==1000, '+\
                         'the model save_dir+1000.pkl would be loaded)')

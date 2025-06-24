@@ -1,0 +1,91 @@
+#
+# 文件功能简介: G2Retro-P预训练配置文件，包含所有预训练和微调相关的超参数
+#
+
+# 数据配置
+data:
+  # 预训练数据路径
+  pretrain_data_path: "data/pubchem_10m.pkl"
+  # 微调数据路径（USPTO-50K）
+  finetune_data_path: "data/uspto_50k.pkl"
+  # 批次大小
+  batch_size: 256
+  # 数据加载线程数
+  num_workers: 8
+  # 是否打乱数据
+  shuffle: true
+
+# 模型配置
+model:
+  # 基础G2Retro模型参数
+  hidden_size: 512
+  num_layers: 6
+  dropout: 0.1
+  # 分子表示维度
+  mol_repr_dim: 512
+  # 对比学习投影维度
+  projection_dim: 128
+  # 温度参数
+  temperature: 0.1
+
+# 预训练配置
+pretrain:
+  # 训练轮数
+  num_epochs: 100
+  # 学习率
+  learning_rate: 0.001
+  # 学习率调度器
+  lr_scheduler:
+    type: "cosine"
+    warmup_steps: 5000
+  # 损失权重
+  loss_weights:
+    base: 1.0      # 基础任务损失权重
+    recovery: 0.5   # 分子恢复损失权重
+    contrastive: 0.3  # 对比学习损失权重
+  # 数据增强配置
+  augmentation:
+    atom_mask_ratio: 0.15    # 原子掩码比例
+    bond_delete_ratio: 0.10  # 键删除比例
+    subgraph_remove_ratio: 0.15  # 子图移除比例
+    subgraph_k_hop: 2        # 子图跳数
+  # 梯度累积步数
+  gradient_accumulation_steps: 4
+  # 混合精度训练
+  fp16: true
+  # 检查点保存
+  save_steps: 5000
+  save_path: "checkpoints/g2retro_p/"
+
+# 微调配置
+finetune:
+  # 训练轮数
+  num_epochs: 50
+  # 学习率（预训练的1/10）
+  learning_rate: 0.0001
+  # 早停策略
+  early_stopping:
+    patience: 5
+    min_delta: 0.001
+  # 参数冻结策略
+  freeze_layers: 0  # 冻结底层的层数，0表示不冻结
+  # 检查点保存
+  save_path: "checkpoints/g2retro_p_finetuned/"
+
+# 评估配置
+evaluation:
+  # Top-k准确率
+  top_k: [1, 3, 5, 10]
+  # 评估批次大小
+  eval_batch_size: 512
+  # 评估间隔（步数）
+  eval_steps: 1000
+
+# 硬件配置
+hardware:
+  # GPU设备
+  device: "cuda"
+  # 使用的GPU数量
+  n_gpu: 1
+  # 随机种子
+  seed: 42
