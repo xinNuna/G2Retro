@@ -1,0 +1,4 @@
+data/USPTO_50K/tensors.pkl
+data/USPTO_FULL/train.csv
+*.pkl
+*.csv
