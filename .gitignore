@@ -1,4 +1,38 @@
-data/USPTO_50K/tensors.pkl
-data/USPTO_FULL/train.csv
+# 忽略整个data文件夹
+data/
+
+# 忽略数据文件
 *.pkl
 *.csv
+
+# 忽略其他大文件
+*.h5
+*.hdf5
+*.tar
+*.tar.gz
+*.zip
+
+# 忽略模型文件
+*.pt
+*.pth
+*.ckpt
+
+# 忽略缓存和临时文件
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.coverage
+.pytest_cache/
+.DS_Store
+
+# 忽略日志文件
+*.log
+logs/
+
+# 忽略结果文件夹中的模型
+results/
+trained_models/*.pt
+trained_models/*.pth
