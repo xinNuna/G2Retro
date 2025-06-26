@@ -187,7 +187,9 @@ class ProductSynthonContrastiveHead(nn.Module):
         
         Args:
             product_embeddings: 产物分子图嵌入 [batch_size, product_input_dim]
-            synthon_embeddings: 合成子图嵌入 [batch_size, synthon_input_dim]
+            synthon_embeddings: 合成子图嵌入 
+                              - 2D: [batch_size, synthon_input_dim] (单合成子或已融合)
+                              - 3D: [batch_size, num_synthons, synthon_input_dim] (多合成子)
             pretrain_infos: 预训练信息列表
             synthon_masks: 合成子有效性掩码 [batch_size, max_synthons] (可选)
             
@@ -195,12 +197,29 @@ class ProductSynthonContrastiveHead(nn.Module):
             (loss, accuracy): 损失值和准确率
         """
         batch_size = product_embeddings.size(0)
+        device = product_embeddings.device
         
         # 投影产物嵌入
         product_proj = self.product_projector(product_embeddings)  # [batch_size, projection_dim]
         
-        # 投影合成子嵌入（假设已经是2D张量）
-        synthon_proj = self.synthon_projector(synthon_embeddings)  # [batch_size, projection_dim]
+        # 处理合成子嵌入
+        if synthon_embeddings.dim() == 3:
+            # 多合成子情况：需要先投影每个合成子，然后融合
+            batch_size, num_synthons, synthon_dim = synthon_embeddings.shape
+            
+            # 重塑为2D进行投影
+            synthon_flat = synthon_embeddings.view(-1, synthon_dim)
+            synthon_proj_flat = self.synthon_projector(synthon_flat)
+            
+            # 重塑回3D
+            synthon_proj_3d = synthon_proj_flat.view(batch_size, num_synthons, self.projection_dim)
+            
+            # 融合多个合成子
+            synthon_proj = self.fuse_synthon_embeddings(synthon_proj_3d, synthon_masks)
+            
+        else:
+            # 单合成子或已融合的情况：直接投影
+            synthon_proj = self.synthon_projector(synthon_embeddings)  # [batch_size, projection_dim]
         
         # L2归一化（对比学习的标准做法）
         product_proj = F.normalize(product_proj, p=2, dim=1)

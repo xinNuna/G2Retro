@@ -82,6 +82,56 @@ def build_moltree_pretrain(data, use_dfs=True, shuffle=False):
         if len(synthon_tree.smiles.split(".")) != len(react_moltree.smiles.split(".")):
             return (None, None, None, set())
             
+        # 提取反应中心识别所需的order信息
+        # 注意：这些信息由update_revise_atoms函数生成并存储在产物分子树中
+        
+        # 1. 提取bond order信息
+        bond_order = []
+        if hasattr(prod_moltree, 'order') and prod_moltree.order is not None:
+            bond_order = prod_moltree.order
+        
+        # 2. 提取change信息 [变化的键, 相邻的键]
+        change_order = [None, []]
+        if hasattr(prod_moltree, 'change') and prod_moltree.change is not None:
+            change_order = prod_moltree.change
+            
+        # 3. 提取ring信息 [环原子, 环键, 断裂标识]
+        ring_order = None
+        if hasattr(prod_moltree, 'ring') and prod_moltree.ring is not None:
+            ring_order = prod_moltree.ring
+            
+        # 4. 提取原子电荷变化信息
+        atom_order = []
+        if hasattr(prod_moltree, 'mol_graph') and prod_moltree.mol_graph is not None:
+            for atom_idx in prod_moltree.mol_graph.nodes:
+                node_data = prod_moltree.mol_graph.nodes[atom_idx]
+                if 'charge_change' in node_data:
+                    charge_change = node_data['charge_change']
+                    atom_order.append((atom_idx, charge_change))
+        
+        # 5. 提取attach信息（连接原子标记）
+        attach_atoms = []
+        if hasattr(prod_moltree, 'mol_graph') and prod_moltree.mol_graph is not None:
+            for atom_idx in prod_moltree.mol_graph.nodes:
+                node_data = prod_moltree.mol_graph.nodes[atom_idx]
+                if 'attach' in node_data and node_data['attach'] == 1:
+                    attach_atoms.append(atom_idx)
+        
+        # 6. 提取revise_bonds信息（修订的化学键）
+        revise_bonds = {}
+        if hasattr(prod_moltree, 'revise_bonds') and prod_moltree.revise_bonds is not None:
+            revise_bonds = prod_moltree.revise_bonds
+        
+        # 组装所有order信息，按照G2Retro predict_centers方法的预期格式
+        product_orders = (
+            bond_order,      # 键的操作顺序
+            change_order,    # 变化的键信息 [变化键, 相邻键]  
+            ring_order,      # 环相关信息
+            atom_order,      # 原子电荷变化
+            attach_atoms,    # 连接原子
+            revise_bonds     # 修订的键
+        )
+            
         # 为预训练添加额外信息
         # 1. 产物分子图用于基础任务和对比学习
         # 2. 合成子结构用于对比学习
@@ -90,13 +140,14 @@ def build_moltree_pretrain(data, use_dfs=True, shuffle=False):
             'product_smiles': prod_smiles,
             'synthon_smiles': synthon_tree.smiles,
             'reactant_smiles': react_smiles,
-            'has_reaction_center': True  # 标记是否包含有效的反应中心
+            'has_reaction_center': True,  # 标记是否包含有效的反应中心
+            'product_orders': product_orders  # 添加反应中心识别所需的order信息
         }
         
         return (prod_moltree, synthon_tree, react_moltree, vocab, pretrain_info)
     except Exception as e:
-        print(f"构建分子树时出错: {e}")
-        return (None, None, None, set(), None)
+        # 不打印单个错误，由批量处理统计汇总
+        return (None, None, None, set(), {'type': 'build_error', 'message': str(e)})
 
 def augment_molecule_for_recovery(mol_smiles, augment_type='atom_mask', ratio=0.15):
     """
@@ -173,7 +224,7 @@ def augment_molecule_for_recovery(mol_smiles, augment_type='atom_mask', ratio=0.
         return augmented_data
         
     except Exception as e:
-        print(f"分子增强时出错: {e}")
+        # 增强失败不打印错误，由调用方处理
         return None
 
 def process_pretrain_data_batch(data_batch, use_dfs=True, shuffle=False):
@@ -260,8 +311,8 @@ def main():
     parser = ArgumentParser()
     parser.add_argument('--uspto_full_train', type=str, required=True, 
                        help="USPTO_FULL训练集路径 (格式: id,reactants>reagents>production)")
-    parser.add_argument('--uspto_full_test', type=str, required=True,
-                       help="USPTO_FULL测试集路径")
+    parser.add_argument('--uspto_full_valid', type=str, required=True,
+                       help="USPTO_FULL验证集路径 (用于预训练验证，不是测试)")
     parser.add_argument('--output_dir', type=str, default="../data/pretrain/", 
                        help="预训练数据输出目录")
     parser.add_argument('--output_name', type=str, default="pretrain_tensors", 
@@ -278,10 +329,10 @@ def main():
     
     print("开始处理USPTO_FULL数据用于预训练...")
     
-    # 处理训练集和测试集
+    # 处理训练集和验证集 (预训练阶段不使用测试集)
     datasets = {
         'train': args.uspto_full_train,
-        'test': args.uspto_full_test
+        'valid': args.uspto_full_valid
     }
     
     for split_name, data_path in datasets.items():
@@ -325,7 +376,13 @@ def main():
             batch_num = i//batch_size + 1
             total_batches = (len(all_data_list)-1)//batch_size + 1
             
-            print(f"处理批次 {batch_num}/{total_batches}")
+            # 显示进度条
+            progress = batch_num / total_batches
+            bar_length = 50
+            filled_length = int(bar_length * progress)
+            bar = '█' * filled_length + '░' * (bar_length - filled_length)
+            percent = progress * 100
+            print(f"\r批次 {batch_num:4d}/{total_batches} [{bar}] {percent:6.1f}%", end='', flush=True)
             
             # 处理当前批次
             batch_results, batch_error_stats = process_pretrain_data_batch(
@@ -339,16 +396,23 @@ def main():
             for key in total_error_stats:
                 total_error_stats[key] += batch_error_stats[key]
             
-            # 每10个批次报告一次进度
-            if batch_num % 10 == 0:
+            # 每100个批次报告一次详细进度
+            if batch_num % 100 == 0:
                 success_rate = (total_error_stats["successful"] / max(total_error_stats["total_processed"], 1)) * 100
-                print(f"  - 已处理: {total_error_stats['total_processed']} 条")
-                print(f"  - 成功: {total_error_stats['successful']} 条 ({success_rate:.1f}%)")
-                print(f"  - 主要错误: 连接原子为零({total_error_stats['zero_connect_atoms']}), "
-                      f"格式错误({total_error_stats['format_error']}), "
-                      f"更新原子错误({total_error_stats['update_atoms_error']})")
+                print(f"\n  ✓ 已处理: {total_error_stats['total_processed']} 条, 成功: {total_error_stats['successful']} 条 ({success_rate:.1f}%)")
+                if total_error_stats['total_processed'] > total_error_stats['successful']:
+                    main_errors = []
+                    if total_error_stats['zero_connect_atoms'] > 0:
+                        main_errors.append(f"零连接原子({total_error_stats['zero_connect_atoms']})")
+                    if total_error_stats['format_error'] > 0:
+                        main_errors.append(f"格式错误({total_error_stats['format_error']})")
+                    if total_error_stats['update_atoms_error'] > 0:
+                        main_errors.append(f"更新错误({total_error_stats['update_atoms_error']})")
+                    if main_errors:
+                        print(f"    主要错误: {', '.join(main_errors)}")
+                print(f"  继续处理...", end='')
         
-        print(f"\n{split_name}集处理完成:")
+        print(f"\n\n{split_name}集处理完成:")
         print(f"总计处理: {total_error_stats['total_processed']} 条反应")
         print(f"成功处理: {total_error_stats['successful']} 条反应")
         success_rate = (total_error_stats['successful'] / max(total_error_stats['total_processed'], 1)) * 100
@@ -387,7 +451,8 @@ def main():
             'total_reactions': len(processed_data),
             'vocab_size': len(global_vocab),
             'augmentation_types': ['atom_mask', 'bond_deletion', 'subgraph_removal'],
-            'data_format': 'pretrain_multitask'
+            'data_format': 'pretrain_multitask',
+            'split_purpose': 'pretraining_train' if split_name == 'train' else 'pretraining_validation'
         }
         
         stats_path = os.path.join(args.output_dir, f"stats_{split_name}.txt")
@@ -399,12 +464,15 @@ def main():
     print("\n预训练数据处理完成！")
     print(f"输出目录: {args.output_dir}")
     print("文件结构:")
-    print("  - pretrain_tensors_train.pkl  # 训练集预训练数据")
-    print("  - pretrain_tensors_test.pkl   # 测试集预训练数据") 
+    print("  - pretrain_tensors_train.pkl  # 预训练训练集")
+    print("  - pretrain_tensors_valid.pkl  # 预训练验证集") 
     print("  - vocab_train.txt             # 训练集词汇表")
-    print("  - vocab_test.txt              # 测试集词汇表")
+    print("  - vocab_valid.txt             # 验证集词汇表")
     print("  - stats_train.txt             # 训练集统计信息")
-    print("  - stats_test.txt              # 测试集统计信息")
+    print("  - stats_valid.txt             # 验证集统计信息")
+    print("\n说明:")
+    print("  ✅ train/valid 用于预训练")
+    print("  ❌ test 保持干净状态，用于下游任务最终评估")
 
 if __name__ == "__main__":
     main()

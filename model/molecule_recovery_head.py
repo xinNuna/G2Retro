@@ -147,12 +147,12 @@ class MoleculeRecoveryHead(nn.Module):
             nn.BatchNorm1d(projection_dim)
         )
         
-        # 新增：掩码感知注意力机制
+        # 新增：掩码感知注意力机制（确保embed_dim能被num_heads整除）
+        num_heads = 6 if input_dim % 6 == 0 else 4  # 300可以被6整除
         self.mask_attention = nn.MultiheadAttention(
             embed_dim=input_dim,
-            num_heads=8,
-            dropout=dropout,
-            batch_first=True
+            num_heads=num_heads,
+            dropout=dropout
         )
         
         # 新增：掩码类型嵌入（区分不同的增强类型）
@@ -220,42 +220,44 @@ class MoleculeRecoveryHead(nn.Module):
         
         # 应用掩码感知注意力
         if len(mol_embeddings.shape) == 2:
-            mol_embeddings_expanded = mol_embeddings.unsqueeze(1)  # [batch_size, 1, input_dim]
-            mask_aware_expanded = mask_aware_embeds.unsqueeze(1)   # [batch_size, 1, input_dim]
+            # 转换为 (seq_len, batch_size, embed_dim) 格式
+            mol_embeddings_transposed = mol_embeddings.unsqueeze(0)  # [1, batch_size, input_dim] 
+            mask_aware_transposed = mask_aware_embeds.unsqueeze(0)   # [1, batch_size, input_dim]
         else:
-            mol_embeddings_expanded = mol_embeddings
-            mask_aware_expanded = mask_aware_embeds.unsqueeze(1).expand(-1, mol_embeddings.size(1), -1)
+            # 如果是3D，转置前两个维度
+            mol_embeddings_transposed = mol_embeddings.transpose(0, 1)  # [seq_len, batch_size, input_dim]
+            mask_aware_transposed = mask_aware_embeds.unsqueeze(0).expand(mol_embeddings.size(1), -1, -1)
         
         # 掩码感知注意力：查询使用掩码感知嵌入，键值使用原始嵌入
         attended_embeds, _ = self.mask_attention(
-            mask_aware_expanded,      # query
-            mol_embeddings_expanded,  # key
-            mol_embeddings_expanded   # value
+            mask_aware_transposed,      # query [seq_len, batch_size, embed_dim]
+            mol_embeddings_transposed,  # key [seq_len, batch_size, embed_dim]
+            mol_embeddings_transposed   # value [seq_len, batch_size, embed_dim]
         )
         
-        # 如果输入是2D，压缩回2D
+        # 转换回原始格式
         if len(mol_embeddings.shape) == 2:
-            attended_embeds = attended_embeds.squeeze(1)
+            attended_embeds = attended_embeds.squeeze(0)  # [batch_size, input_dim]
+        else:
+            attended_embeds = attended_embeds.transpose(0, 1)  # [batch_size, seq_len, input_dim]
         
         return attended_embeds
     
     def forward(self, 
                 original_embeddings: torch.Tensor,
+                augmented_embeddings: torch.Tensor,
                 augmented_data: List[Dict],
-                pretrain_infos: List[Dict],
-                mol_encoder=None,
-                vocab=None,
-                avocab=None) -> Tuple[torch.Tensor, float]:
+                pretrain_infos: List[Dict]) -> Tuple[torch.Tensor, float]:
         """
         前向传播 - 计算分子恢复的对比学习损失
         
+        按照设计方案：h_augmented被送入分子恢复头，学习从增强表示恢复原始表示
+        
         Args:
-            original_embeddings: 原始分子的图嵌入 [batch_size, input_dim]
+            original_embeddings: 原始分子的图嵌入 [batch_size, input_dim] (h_product)
+            augmented_embeddings: 增强分子的图嵌入 [batch_size, input_dim] (h_augmented)
             augmented_data: 增强数据信息
             pretrain_infos: 预训练信息
-            mol_encoder: 分子编码器（用于编码增强的MolTree）
-            vocab: 词汇表
-            avocab: 原子词汇表
             
         Returns:
             (loss, accuracy): 损失值和准确率
@@ -263,9 +265,8 @@ class MoleculeRecoveryHead(nn.Module):
         batch_size = original_embeddings.size(0)
         device = original_embeddings.device
         
-        # 为每个样本创建掩码信息和真正的增强嵌入
+        # 为每个样本创建掩码信息
         mask_info = []
-        augmented_embeddings_list = []
         
         for i in range(batch_size):
             # 获取当前样本的增强信息
@@ -273,56 +274,18 @@ class MoleculeRecoveryHead(nn.Module):
             if i < len(augmented_data):
                 sample_aug_data = augmented_data[i] if isinstance(augmented_data[i], list) else [augmented_data[i]]
             
-            if sample_aug_data and mol_encoder is not None and vocab is not None and avocab is not None:
+            if sample_aug_data:
                 # 使用第一个增强版本的信息
                 aug_info = sample_aug_data[0]
                 mask_info.append({
                     'type': aug_info.get('augment_type', 'none'),
                     'indices': aug_info.get('masked_indices', [])
                 })
-                
-                # 创建真正的增强MolTree并获取其嵌入
-                try:
-                    product_smiles = pretrain_infos[i]['product_smiles']
-                    
-                    # 创建原始MolTree
-                    from moltree import MolTree
-                    original_tree = MolTree(product_smiles)
-                    
-                    # 应用图结构级别掩码增强
-                    augmented_tree = apply_molclr_graph_augmentation(
-                        original_tree,
-                        aug_info.get('masked_indices', []),
-                        aug_info.get('augment_type', 'none')
-                    )
-                    
-                    # 使用编码器获取增强MolTree的嵌入
-                    aug_batch, aug_tensors = MolTree.tensorize(
-                        [augmented_tree], vocab, avocab, 
-                        use_feature=True, product=True
-                    )
-                    
-                    # 编码增强的分子树
-                    with torch.no_grad():
-                        aug_embed, _, _ = mol_encoder.encode_with_gmpn([aug_tensors])
-                    
-                    augmented_embeddings_list.append(aug_embed)
-                    print(f"样本 {i}: 成功获取图结构级别增强嵌入")
-                    
-                except Exception as e:
-                    print(f"样本 {i} 增强嵌入获取错误: {e}")
-                    # 如果增强失败，使用原始嵌入
-                    augmented_embeddings_list.append(original_embeddings[i:i+1])
-                    mask_info.append({'type': 'none', 'indices': []})
             else:
-                # 没有增强数据或缺少编码器，使用原始嵌入
+                # 没有增强数据
                 mask_info.append({'type': 'none', 'indices': []})
-                augmented_embeddings_list.append(original_embeddings[i:i+1])
         
-        # 拼接所有增强嵌入
-        augmented_embeddings = torch.cat(augmented_embeddings_list, dim=0)
-        
-        # 应用掩码感知编码
+        # 应用掩码感知编码到增强嵌入
         mask_aware_augmented = self.apply_mask_aware_encoding(augmented_embeddings, mask_info)
         
         # 通过投影头获得对比学习表示
@@ -569,17 +532,17 @@ if __name__ == "__main__":
     pretrain_infos = [{'type': 'none', 'indices': []}] * batch_size
     
     # 前向传播
-    results = recovery_head(original_embeddings, augmented_data, pretrain_infos)
+    results = recovery_head(original_embeddings, original_embeddings, augmented_data, pretrain_infos)
     
     print(f"✅ 分子恢复损失: {results[0].item():.4f}")
     print(f"✅ 对比学习准确率: {results[1]:.4f}")
     print(f"✅ 原始分子投影形状: {original_embeddings.shape}")
-    print(f"✅ 增强分子投影形状: {augmented_data[0]['augmented_embeddings'].shape}")
+    print(f"✅ 增强分子投影形状: {original_embeddings.shape}")
     
     # 测试相似度计算
     similarity = recovery_head.compute_molecular_similarity(
         original_embeddings[:10], 
-        augmented_data[0]['augmented_embeddings'][:10]
+        original_embeddings[:10]
     )
     print(f"✅ 分子相似度矩阵形状: {similarity.shape}")
     
