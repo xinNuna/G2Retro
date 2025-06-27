@@ -56,6 +56,11 @@ def check_data_files():
         'vocab': '../data/pretrain/vocab_train.txt'
     }
     
+    # 如果是demo模式，可以都使用验证集（更小的文件）来快速测试
+    if '--mode' in sys.argv and sys.argv[sys.argv.index('--mode') + 1] == 'demo':
+        print("⚡ Demo模式：使用验证集作为训练集以加快加载速度")
+        files['train_data'] = '../data/pretrain/pretrain_tensors_valid.pkl'  # 使用更小的valid集
+    
     print("\n检查数据文件:")
     all_exist = True
     for name, path in files.items():

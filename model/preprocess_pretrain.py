@@ -32,7 +32,9 @@ def convert_uspto_full_format(row):
     """
     try:
         id_val = row['id']
-        reaction_parts = row['rxn_smiles'].split('>')
+        # USPTO_FULL数据的列名是 'reactants>reagents>production'
+        reaction_full = row['reactants>reagents>production']
+        reaction_parts = reaction_full.split('>')
         
         if len(reaction_parts) != 3:
             return None
@@ -82,55 +84,9 @@ def build_moltree_pretrain(data, use_dfs=True, shuffle=False):
         if len(synthon_tree.smiles.split(".")) != len(react_moltree.smiles.split(".")):
             return (None, None, None, set())
             
-        # 提取反应中心识别所需的order信息
-        # 注意：这些信息由update_revise_atoms函数生成并存储在产物分子树中
-        
-        # 1. 提取bond order信息
-        bond_order = []
-        if hasattr(prod_moltree, 'order') and prod_moltree.order is not None:
-            bond_order = prod_moltree.order
-        
-        # 2. 提取change信息 [变化的键, 相邻的键]
-        change_order = [None, []]
-        if hasattr(prod_moltree, 'change') and prod_moltree.change is not None:
-            change_order = prod_moltree.change
-            
-        # 3. 提取ring信息 [环原子, 环键, 断裂标识]
-        ring_order = None
-        if hasattr(prod_moltree, 'ring') and prod_moltree.ring is not None:
-            ring_order = prod_moltree.ring
-            
-        # 4. 提取原子电荷变化信息
-        atom_order = []
-        if hasattr(prod_moltree, 'mol_graph') and prod_moltree.mol_graph is not None:
-            for atom_idx in prod_moltree.mol_graph.nodes:
-                node_data = prod_moltree.mol_graph.nodes[atom_idx]
-                if 'charge_change' in node_data:
-                    charge_change = node_data['charge_change']
-                    atom_order.append((atom_idx, charge_change))
-        
-        # 5. 提取attach信息（连接原子标记）
-        attach_atoms = []
-        if hasattr(prod_moltree, 'mol_graph') and prod_moltree.mol_graph is not None:
-            for atom_idx in prod_moltree.mol_graph.nodes:
-                node_data = prod_moltree.mol_graph.nodes[atom_idx]
-                if 'attach' in node_data and node_data['attach'] == 1:
-                    attach_atoms.append(atom_idx)
-        
-        # 6. 提取revise_bonds信息（修订的化学键）
-        revise_bonds = {}
-        if hasattr(prod_moltree, 'revise_bonds') and prod_moltree.revise_bonds is not None:
-            revise_bonds = prod_moltree.revise_bonds
-        
-        # 组装所有order信息，按照G2Retro predict_centers方法的预期格式
-        product_orders = (
-            bond_order,      # 键的操作顺序
-            change_order,    # 变化的键信息 [变化键, 相邻键]  
-            ring_order,      # 环相关信息
-            atom_order,      # 原子电荷变化
-            attach_atoms,    # 连接原子
-            revise_bonds     # 修订的键
-        )
+        # 注意：update_revise_atoms函数已经在prod_moltree上正确设置了所有反应中心信息
+        # 包括：change, order, ring, revise_bonds等属性
+        # 我们不需要重新提取这些信息
             
         # 为预训练添加额外信息
         # 1. 产物分子图用于基础任务和对比学习
@@ -140,8 +96,8 @@ def build_moltree_pretrain(data, use_dfs=True, shuffle=False):
             'product_smiles': prod_smiles,
             'synthon_smiles': synthon_tree.smiles,
             'reactant_smiles': react_smiles,
-            'has_reaction_center': True,  # 标记是否包含有效的反应中心
-            'product_orders': product_orders  # 添加反应中心识别所需的order信息
+            'has_reaction_center': True  # 标记是否包含有效的反应中心
+            # 注意：不需要单独存储product_orders，这些信息已经在分子树对象上了
         }
         
         return (prod_moltree, synthon_tree, react_moltree, vocab, pretrain_info)
@@ -258,18 +214,21 @@ def process_pretrain_data_batch(data_batch, use_dfs=True, shuffle=False):
         # 构建分子树
         mol_tree_result = build_moltree_pretrain(converted_data, use_dfs, shuffle)
         
+        # 处理不同的返回情况
         if len(mol_tree_result) == 5:
             prod_moltree, synthon_tree, react_moltree, vocab, pretrain_info = mol_tree_result
             
-            if mol_tree_result[0] is None:
+            # 检查是否处理成功
+            if prod_moltree is None:
                 # 统计错误类型
-                if len(mol_tree_result) > 4 and isinstance(mol_tree_result[4], dict):
-                    error_info = mol_tree_result[4]
-                    error_type = error_info.get("type", "unknown_error")
+                if isinstance(pretrain_info, dict) and 'type' in pretrain_info:
+                    error_type = pretrain_info.get("type", "unknown_error")
                     if error_type in error_stats:
                         error_stats[error_type] += 1
                     else:
                         error_stats["unknown_error"] += 1
+                else:
+                    error_stats["unknown_error"] += 1
                 continue
             
             error_stats["successful"] += 1
@@ -301,6 +260,10 @@ def process_pretrain_data_batch(data_batch, use_dfs=True, shuffle=False):
             }
             
             results.append(pretrain_entry)
+        else:
+            # 处理返回值格式不正确的情况
+            error_stats["unknown_error"] += 1
+            continue
     
     return results, error_stats
 
@@ -342,9 +305,7 @@ def main():
         if data_path.endswith('.csv'):
             # USPTO_FULL格式的CSV文件
             all_data = pd.read_csv(data_path, sep=',')
-            # 重命名列以匹配期望的格式
-            if 'reactants>reagents>production' in all_data.columns:
-                all_data = all_data.rename(columns={'reactants>reagents>production': 'rxn_smiles'})
+            # 注意：不需要重命名列，我们的convert_uspto_full_format函数会处理原始列名
         else:
             print(f"不支持的文件格式: {data_path}")
             continue

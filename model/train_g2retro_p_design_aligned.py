@@ -167,6 +167,22 @@ def apply_molclr_graph_augmentation(mol_tree, masked_indices, augment_type):
         augmented_tree.augment_type = augment_type
         augmented_tree.masked_indices = masked_indices
         
+        # 重要：为增强分子树复制原始分子树的change属性
+        # 即使是增强版本，也需要保持原始的反应中心信息用于基础任务训练
+        if hasattr(mol_tree, 'change') and mol_tree.change is not None:
+            augmented_tree.change = mol_tree.change
+        else:
+            # 如果原始树没有change属性，则设置为空的6元组
+            augmented_tree.change = ([], [], [], [], [], [])
+            
+        # 同时复制其他反应中心相关属性
+        if hasattr(mol_tree, 'order'):
+            augmented_tree.order = mol_tree.order
+        if hasattr(mol_tree, 'ring'):
+            augmented_tree.ring = mol_tree.ring
+        if hasattr(mol_tree, 'revise_bonds'):
+            augmented_tree.revise_bonds = mol_tree.revise_bonds
+        
         return augmented_tree
         
     except Exception as e:
@@ -275,11 +291,15 @@ def g2retro_design_aligned_collate_fn(batch, vocab, avocab):
                 # 获取产物SMILES
                 product_smiles = pretrain_infos[i]['product_smiles']
                 
+                # 注意：update_revise_atoms函数已经正确设置了prod_tree的所有属性
+                # 包括：change, order, ring, revise_bonds等
+                # 我们不需要重新设置这些属性
+                
                 # 使用新的图结构级别增强方法
                 sample_aug_trees = create_augmented_moltrees(
                     augmented_data, 
                     product_smiles,
-                    original_tree=prod_tree  # 传入原始分子树
+                    original_tree=prod_tree  # 传入已设置反应中心信息的分子树
                 )
                 
                 if sample_aug_trees:
@@ -300,28 +320,30 @@ def g2retro_design_aligned_collate_fn(batch, vocab, avocab):
         print("张量化处理...")
         
         # 1. 原始产物图 Gp → prod_tensors
-        prod_batch, prod_tensors = MolTree.tensorize(
+        # 注意：返回值的第一个是mol_batch（分子树列表），第二个才是张量
+        _, prod_tensors = MolTree.tensorize(
             prod_trees, vocab, avocab, 
             use_feature=True, product=True
         )
         print(f"  原始产物张量化完成")
         
         # 2. 增强产物图 Gp_aug → aug_tensors
-        aug_batch, aug_tensors = MolTree.tensorize(
+        _, aug_tensors = MolTree.tensorize(
             aug_trees, vocab, avocab, 
             use_feature=True, product=True
         )
         print(f"  增强产物张量化完成")
         
         # 3. 合成子组合 Gs → synthon_tensors
-        synthon_batch, synthon_tensors = MolTree.tensorize(
+        # 注意：合成子树不是产物，应该使用product=False
+        _, synthon_tensors = MolTree.tensorize(
             synthon_trees, vocab, avocab, 
-            use_feature=True, product=True
+            use_feature=True, product=False
         )
         print(f"  合成子张量化完成")
         
         # 4. 反应物张量化（用于基础任务）
-        react_batch, react_tensors = MolTree.tensorize(
+        _, react_tensors = MolTree.tensorize(
             react_trees, vocab, avocab, 
             use_feature=True, product=False
         )
@@ -400,7 +422,8 @@ class G2RetroPDesignAlignedModel(nn.Module):
         # 3. 产物-合成子对比头：核心创新
         print("  - 产物-合成子对比头：核心创新")
         self.product_synthon_contrastive_head = ProductSynthonContrastiveHead(
-            input_dim=args.hidden_size,
+            product_input_dim=args.hidden_size,
+            synthon_input_dim=args.hidden_size,
             projection_dim=128,
             temperature=0.1,
             fusion_method='attention'  # 处理多合成子
@@ -442,8 +465,8 @@ class G2RetroPDesignAlignedModel(nn.Module):
         print(f"✓ 权重更新频率：每{self.weight_update_frequency}步")
         print(f"✓ 温度系数：{self.temperature}")
         print(f"✓ 损失队列长度：{self.loss_queue_length}")
-        print(f"✓ 词汇表大小: {len(vocab)}")
-        print(f"✓ 原子词汇表大小: {len(avocab)}")
+        print(f"✓ 词汇表大小: {vocab.size()}")
+        print(f"✓ 原子词汇表大小: {avocab.size()}")
         print(f"✓ 隐藏层大小: {args.hidden_size}")
 
     def update_task_weights(self, current_losses):
@@ -663,10 +686,26 @@ class G2RetroPDesignAlignedModel(nn.Module):
         react_tensors = batch['react_tensors']     # 用于基础任务
         
         # 转换为CUDA张量
-        prod_tensors = make_cuda(prod_tensors, product=True)
-        aug_tensors = make_cuda(aug_tensors, product=True)
-        synthon_tensors = make_cuda(synthon_tensors, product=True)
-        react_tensors = make_cuda(react_tensors, product=False)
+        # 注意：张量数据是嵌套结构 [graph_tensors] 或 [[graph_tensors], ...]
+        if isinstance(prod_tensors, list) and len(prod_tensors) > 0:
+            prod_tensors = make_cuda(prod_tensors[0], product=True)
+        else:
+            prod_tensors = make_cuda(prod_tensors, product=True)
+            
+        if isinstance(aug_tensors, list) and len(aug_tensors) > 0:
+            aug_tensors = make_cuda(aug_tensors[0], product=True)
+        else:
+            aug_tensors = make_cuda(aug_tensors, product=True)
+            
+        if isinstance(synthon_tensors, list) and len(synthon_tensors) > 0:
+            synthon_tensors = make_cuda(synthon_tensors[0], product=False)
+        else:
+            synthon_tensors = make_cuda(synthon_tensors, product=False)
+            
+        if isinstance(react_tensors, list) and len(react_tensors) > 0:
+            react_tensors = make_cuda(react_tensors[0], product=False)
+        else:
+            react_tensors = make_cuda(react_tensors, product=False)
         
         batch_size = batch['batch_size']
         
@@ -703,7 +742,21 @@ class G2RetroPDesignAlignedModel(nn.Module):
                 product_trees = batch.get('prod_trees', [])
                 
                 # 从产物张量中正确提取所需信息
-                product_graph_tensors, product_bond_tensors, product_scope_tensors, product_tree_tensors = prod_tensors
+                # make_cuda返回的是一个列表，需要先提取内容
+                if isinstance(prod_tensors, list) and len(prod_tensors) > 0:
+                    product_tensors_data = prod_tensors[0]
+                else:
+                    product_tensors_data = prod_tensors
+                    
+                # 现在解包张量数据
+                if len(product_tensors_data) >= 7:
+                    # 完整的张量格式
+                    product_bond_tensors = product_tensors_data[1]  # bond tensor
+                    product_scope_tensors = product_tensors_data[-1]  # scope tensor
+                else:
+                    # 简化格式，可能需要调整
+                    product_bond_tensors = product_tensors_data[1] if len(product_tensors_data) > 1 else None
+                    product_scope_tensors = product_tensors_data[-1] if len(product_tensors_data) > 0 else None
                 
                 # 提取每个样本的完整order信息  
                 product_orders = []
