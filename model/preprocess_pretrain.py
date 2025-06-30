@@ -227,8 +227,8 @@ def process_pretrain_data_batch(data_batch, use_dfs=True, shuffle=False):
                         error_stats[error_type] += 1
                     else:
                         error_stats["unknown_error"] += 1
-                else:
-                    error_stats["unknown_error"] += 1
+                    else:
+                        error_stats["unknown_error"] += 1
                 continue
             
             error_stats["successful"] += 1

@@ -16,6 +16,7 @@ G2Retro-P 设计方案完全对齐实现
 import sys
 import os
 import pickle
+import copy
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -40,343 +41,9 @@ from config import device
 from molecule_recovery_head import MoleculeRecoveryHead
 from product_synthon_contrastive_head import ProductSynthonContrastiveHead
 
-class G2RetroPDesignAlignedDataset(Dataset):
-    """
-    完全符合设计方案的G2Retro-P预训练数据集
-    严格按照设计方案的数据流程处理：
-    - 输入处理: 基于atom-mapping从反应数据中提取产物分子图Gp和对应的合成子组合Gs
-    - 数据增强: 对原始产物分子图应用MolCLR增强策略，生成被"破坏"的版本Gp_aug
-    """
-    def __init__(self, data_path, vocab_path, max_samples=None):
-        print(f"加载预训练数据: {data_path}")
-        with open(data_path, 'rb') as f:
-            self.data = pickle.load(f)
-        
-        if max_samples:
-            self.data = self.data[:max_samples]
-            
-        print(f"加载词汇表: {vocab_path}")
-        with open(vocab_path, 'r') as f:
-            words = [line.strip() for line in f.readlines()]
-        
-        # 使用完整词汇表（设计方案要求）
-        self.vocab = Vocab(words)
-        # 使用正确的原子词汇表（设计方案要求）
-        self.avocab = common_atom_vocab
-        
-        print(f"数据集大小: {len(self.data)}")
-        print(f"分子词汇表大小: {self.vocab.size()} (设计方案要求：完整词汇表)")
-        print(f"原子词汇表大小: {self.avocab.size()} (设计方案要求：common_atom_vocab)")
+# 导入数据集相关组件
+from g2retro_p_dataset import G2RetroPDesignAlignedDataset, g2retro_design_aligned_collate_fn
 
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        """获取单个数据样本"""
-        try:
-            data_item = self.data[idx]
-            
-            # 提取分子树
-            mol_trees = data_item['mol_trees']  # [产物树, 合成子树, 反应物树]
-            
-            # 提取预训练信息
-            pretrain_info = data_item['pretrain_info']
-            
-            # 提取增强数据
-            augmented_data = data_item['augmented_data']
-            
-            return {
-                'mol_trees': mol_trees,
-                'pretrain_info': pretrain_info,
-                'augmented_data': augmented_data
-            }
-            
-        except Exception as e:
-            print(f"数据加载错误 (idx={idx}): {e}")
-            return None
-
-def apply_molclr_graph_augmentation(mol_tree, masked_indices, augment_type):
-    """
-    按照MolCLR思想在MolTree的图结构上进行掩码操作
-    不修改底层化学结构，只在图表示级别进行临时增强
-    """
-    import copy
-    
-    try:
-        # 深拷贝MolTree以避免修改原始对象
-        augmented_tree = copy.deepcopy(mol_tree)
-        
-        # 获取分子图 (NetworkX DiGraph)
-        mol_graph = augmented_tree.mol_graph
-        
-        if augment_type == 'atom_mask':
-            # 原子掩码：在图节点级别进行掩码，不改变化学结构
-            for atom_idx in masked_indices:
-                if atom_idx in mol_graph.nodes:
-                    node_data = mol_graph.nodes[atom_idx]
-                    # 保存原始特征
-                    node_data['original_label'] = node_data.get('label', '')
-                    node_data['original_aroma'] = node_data.get('aroma', False)
-                    # 设置掩码标记
-                    node_data['masked'] = True
-                    node_data['label'] = '[MASK]'  # 掩码标记
-                    node_data['aroma'] = False  # 重置芳香性
-                    print(f"原子掩码: 节点 {atom_idx}")
-                    
-        elif augment_type == 'bond_deletion':
-            # 键删除：在图边级别进行掩码，不删除实际化学键
-            edges_list = list(mol_graph.edges())
-            for bond_idx in masked_indices:
-                if bond_idx < len(edges_list):
-                    edge = edges_list[bond_idx]
-                    if mol_graph.has_edge(edge[0], edge[1]):
-                        edge_data = mol_graph.edges[edge]
-                        # 保存原始边特征
-                        edge_data['original_bond_type'] = edge_data.get('bond_type', 1)
-                        edge_data['original_is_conju'] = edge_data.get('is_conju', False)
-                        # 设置掩码标记
-                        edge_data['masked'] = True
-                        edge_data['bond_type'] = 0  # 设为无键类型
-                        edge_data['is_conju'] = False
-                        print(f"键删除: 边 {edge}")
-                        
-        elif augment_type == 'subgraph_removal':
-            # 子图移除：在图节点级别进行掩码
-            for atom_idx in masked_indices:
-                if atom_idx in mol_graph.nodes:
-                    node_data = mol_graph.nodes[atom_idx]
-                    # 保存原始特征
-                    node_data['original_label'] = node_data.get('label', '')
-                    node_data['original_aroma'] = node_data.get('aroma', False)
-                    # 设置掩码标记
-                    node_data['masked'] = True
-                    node_data['label'] = '[REMOVED]'  # 移除标记
-                    node_data['aroma'] = False
-                    
-                    # 同时掩码相关的边
-                    for neighbor in mol_graph.neighbors(atom_idx):
-                        if mol_graph.has_edge(atom_idx, neighbor):
-                            edge_data = mol_graph.edges[atom_idx, neighbor]
-                            edge_data['masked'] = True
-                            edge_data['original_bond_type'] = edge_data.get('bond_type', 1)
-                            edge_data['bond_type'] = 0
-                    print(f"子图移除: 节点 {atom_idx} 及其邻接边")
-        
-        # 更新增强信息
-        augmented_tree.augmented = True
-        augmented_tree.augment_type = augment_type
-        augmented_tree.masked_indices = masked_indices
-        
-        # 重要：为增强分子树复制原始分子树的change属性
-        # 即使是增强版本，也需要保持原始的反应中心信息用于基础任务训练
-        if hasattr(mol_tree, 'change') and mol_tree.change is not None:
-            augmented_tree.change = mol_tree.change
-        else:
-            # 如果原始树没有change属性，则设置为空的6元组
-            augmented_tree.change = ([], [], [], [], [], [])
-            
-        # 同时复制其他反应中心相关属性
-        if hasattr(mol_tree, 'order'):
-            augmented_tree.order = mol_tree.order
-        if hasattr(mol_tree, 'ring'):
-            augmented_tree.ring = mol_tree.ring
-        if hasattr(mol_tree, 'revise_bonds'):
-            augmented_tree.revise_bonds = mol_tree.revise_bonds
-        
-        return augmented_tree
-        
-    except Exception as e:
-        print(f"MolCLR图增强错误: {e}")
-        return mol_tree  # 返回原始树作为备选
-
-def create_augmented_moltrees(augmented_data, original_smiles, original_tree=None):
-    """
-    按照MolCLR思想创建增强的分子树
-    在图结构级别进行掩码操作，不修改底层化学结构
-    
-    设计方案要求：对原始产物分子图应用MolCLR增强策略，生成被"破坏"的版本Gp_aug
-    三种增强方式：
-    1. 原子掩码 (Atom Masking): 在图节点级别隐藏原子特征
-    2. 键删除 (Bond Deletion): 在图边级别掩码化学键信息  
-    3. 子图移除 (Subgraph Removal): 在图级别掩码连通子图
-    """
-    augmented_trees = []
-    
-    # 如果没有提供原始树，创建一个
-    if original_tree is None:
-        try:
-            original_tree = MolTree(original_smiles)
-        except Exception as e:
-            print(f"创建原始分子树失败: {e}")
-            return augmented_trees
-    
-    for aug_data in augmented_data:
-        if aug_data['original_smiles'] == original_smiles:
-            try:
-                # 在图结构级别应用MolCLR增强
-                augmented_tree = apply_molclr_graph_augmentation(
-                    original_tree,
-                    aug_data['masked_indices'],
-                    aug_data['augment_type']
-                )
-                
-                if augmented_tree is not None:
-                    augmented_trees.append(augmented_tree)
-                    print(f"成功创建MolCLR风格增强分子树: {aug_data['augment_type']}")
-                    
-            except Exception as e:
-                print(f"MolCLR增强分子树创建错误: {e}")
-                # 如果增强失败，使用原始分子树作为备选
-                try:
-                    augmented_trees.append(copy.deepcopy(original_tree))
-                except:
-                    continue
-                
-    return augmented_trees
-
-def g2retro_design_aligned_collate_fn(batch, vocab, avocab):
-    """
-    设计方案对齐的批处理函数
-    使用MolCLR图结构级别掩码增强
-    
-    设计方案要求的数据流程：
-    1. 输入处理: 基于atom-mapping从反应数据中提取产物分子图Gp和对应的合成子组合Gs
-    2. 数据增强: 对原始产物分子图应用MolCLR增强策略，生成一个被"破坏"的版本Gp_aug
-    3. 三路共享编码准备: 
-       - 原始产物图 Gp → prod_tensors
-       - 增强产物图 Gp_aug → aug_tensors 
-       - 合成子组合 Gs → synthon_tensors
-    """
-    # 过滤空样本
-    valid_batch = [item for item in batch if item is not None]
-    if not valid_batch:
-        return None
-    
-    try:
-        print(f"批处理函数：处理 {len(valid_batch)} 个样本")
-        
-        # 提取数据
-        prod_trees = []
-        synthon_trees = []
-        react_trees = []
-        augmented_data_batch = []
-        pretrain_infos = []
-        
-        for item in valid_batch:
-            mol_trees = item['mol_trees']
-            augmented_data = item['augmented_data']
-            pretrain_info = item['pretrain_info']
-            
-            # 分子树
-            prod_trees.append(mol_trees[0])     # 产物树
-            synthon_trees.append(mol_trees[1])  # 合成子树
-            react_trees.append(mol_trees[2])    # 反应物树
-            
-            # 预训练信息
-            pretrain_infos.append(pretrain_info)
-            
-            # 增强数据处理
-            augmented_data_batch.append(augmented_data)
-        
-        print(f"  产物分子树: {len(prod_trees)}")
-        print(f"  合成子分子树: {len(synthon_trees)}")
-        print(f"  反应物分子树: {len(react_trees)}")
-        
-        # 按照设计方案：应用MolCLR图结构级别增强策略
-        print("应用MolCLR图结构级别增强策略...")
-        aug_trees = []
-        
-        for i, (prod_tree, augmented_data) in enumerate(zip(prod_trees, augmented_data_batch)):
-            try:
-                # 获取产物SMILES
-                product_smiles = pretrain_infos[i]['product_smiles']
-                
-                # 注意：update_revise_atoms函数已经正确设置了prod_tree的所有属性
-                # 包括：change, order, ring, revise_bonds等
-                # 我们不需要重新设置这些属性
-                
-                # 使用新的图结构级别增强方法
-                sample_aug_trees = create_augmented_moltrees(
-                    augmented_data, 
-                    product_smiles,
-                    original_tree=prod_tree  # 传入已设置反应中心信息的分子树
-                )
-                
-                if sample_aug_trees:
-                    aug_trees.append(sample_aug_trees[0])  # 使用第一个增强版本
-                    print(f"    样本 {i}: 成功创建图结构级别增强分子树")
-                else:
-                    # 如果增强失败，使用原始树
-                    aug_trees.append(prod_tree)
-                    print(f"    样本 {i}: 增强失败，使用原始分子树")
-                    
-            except Exception as e:
-                print(f"    样本 {i} 增强错误: {e}")
-                aug_trees.append(prod_tree)  # 使用原始树作为备选
-        
-        print(f"  增强分子树: {len(aug_trees)}")
-        
-        # 张量化处理
-        print("张量化处理...")
-        
-        # 1. 原始产物图 Gp → prod_tensors
-        # 注意：返回值的第一个是mol_batch（分子树列表），第二个才是张量
-        _, prod_tensors = MolTree.tensorize(
-            prod_trees, vocab, avocab, 
-            use_feature=True, product=True
-        )
-        print(f"  原始产物张量化完成")
-        
-        # 2. 增强产物图 Gp_aug → aug_tensors
-        _, aug_tensors = MolTree.tensorize(
-            aug_trees, vocab, avocab, 
-            use_feature=True, product=True
-        )
-        print(f"  增强产物张量化完成")
-        
-        # 3. 合成子组合 Gs → synthon_tensors
-        # 注意：合成子树不是产物，应该使用product=False
-        _, synthon_tensors = MolTree.tensorize(
-            synthon_trees, vocab, avocab, 
-            use_feature=True, product=False
-        )
-        print(f"  合成子张量化完成")
-        
-        # 4. 反应物张量化（用于基础任务）
-        _, react_tensors = MolTree.tensorize(
-            react_trees, vocab, avocab, 
-            use_feature=True, product=False
-        )
-        print(f"  反应物张量化完成")
-        
-        # 构建批次字典
-        batch_dict = {
-            'batch_size': len(valid_batch),
-            'prod_tensors': prod_tensors,      # Gp：原始产物图
-            'aug_tensors': aug_tensors,        # Gp_aug：增强产物图
-            'synthon_tensors': synthon_tensors, # Gs：合成子组合
-            'react_tensors': react_tensors,    # 反应物（基础任务用）
-            'prod_trees': prod_trees,          # 产物分子树（基础任务需要）
-            'synthon_trees': synthon_trees,    # 合成子分子树
-            'react_trees': react_trees,        # 反应物分子树
-            'augmented_trees': aug_trees,      # 增强分子树
-            'augmented_data': augmented_data_batch,  # 增强数据信息
-            'pretrain_infos': pretrain_infos   # 预训练信息（包含product_orders）
-        }
-        
-        print(f"批处理完成：{len(valid_batch)} 个样本")
-        print(f"设计方案三路数据流准备就绪：")
-        print(f"  - Gp (原始产物图) → GMPN编码器")
-        print(f"  - Gp_aug (增强产物图) → GMPN编码器") 
-        print(f"  - Gs (合成子组合) → GMPN编码器")
-        
-        return batch_dict
-        
-    except Exception as e:
-        print(f"批处理函数错误: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
 
 class G2RetroPDesignAlignedModel(nn.Module):
     """
@@ -639,7 +306,7 @@ class G2RetroPDesignAlignedModel(nn.Module):
         self.max_weight = state['max_weight']
         self.weight_update_frequency = state['weight_update_frequency']
 
-    def encode_with_gmpn(self, tensors, classes=None):
+    def encode_with_gmpn(self, tensors, classes=None, mol_trees=None):
         """
         使用共享的GMPN编码器进行编码
         
@@ -649,15 +316,63 @@ class G2RetroPDesignAlignedModel(nn.Module):
         
         输入: 分子图 G = (A, B)，其中 A 是原子集合，B 是化学键集合
         输出: 原子级别的嵌入表示 ai，键级别的嵌入表示 bij，以及整个分子图的全局表示 h
+        
+        Args:
+            mol_trees: MolTree对象列表，用于MolCLR掩码支持
         """
-        # 使用共享的GMPN编码器
-        mol_embeds, atom_embeds, mess_embeds = self.shared_encoder(
-            tensors, 
-            product=True, 
-            classes=classes, 
-            use_feature=True
-        )
+        # 使用共享的GMPN编码器，支持MolCLR掩码
+        # 确保传入的格式正确
+        if isinstance(tensors, list) and len(tensors) == 1:
+            # 如果是单个图张量的列表格式，直接传入
+            mol_embeds, atom_embeds, mess_embeds = self.shared_encoder(
+                tensors,
+                product=True, 
+                classes=classes, 
+                use_feature=True,
+                mol_trees=mol_trees
+            )
+        else:
+            # 如果是直接的图张量，包装成列表
+            mol_embeds, atom_embeds, mess_embeds = self.shared_encoder(
+                [tensors],
+                product=True, 
+                classes=classes, 
+                use_feature=True,
+                mol_trees=mol_trees
+            )
         return mol_embeds, atom_embeds, mess_embeds
+    
+    def merge_batch_tensors(self, tensor_list):
+        """合并批次中的张量数据"""
+        if not tensor_list:
+            return []
+        
+        # 获取第一个样本的结构作为参考
+        first_sample = tensor_list[0]
+        if not isinstance(first_sample, (list, tuple)):
+            return tensor_list
+        
+        # 按位置合并所有样本的张量
+        merged = []
+        for i in range(len(first_sample)):
+            if i < 6:  # 前6个是需要合并的张量
+                # 收集所有样本在位置i的张量
+                tensors_at_i = [sample[i] for sample in tensor_list]
+                # 如果是列表，需要拼接
+                if isinstance(tensors_at_i[0], list):
+                    merged_tensor = []
+                    for t in tensors_at_i:
+                        merged_tensor.extend(t)
+                    merged.append(merged_tensor)
+                else:
+                    merged.append(tensors_at_i)
+            else:
+                # 其他位置的数据直接使用第一个样本的
+                merged.append(first_sample[i])
+        
+        return merged
+    # ========== 辅助函数结束 ==========
+
 
     def forward(self, batch, epoch=0):
         """
@@ -678,60 +393,120 @@ class G2RetroPDesignAlignedModel(nn.Module):
         """
         losses = {}
         metrics = {}
-        
-        # 获取张量数据
+        # 获取张量数据 - 注意这里的数据结构
         prod_tensors = batch['prod_tensors']      # Gp
         aug_tensors = batch['aug_tensors']        # Gp_aug  
         synthon_tensors = batch['synthon_tensors'] # Gs
         react_tensors = batch['react_tensors']     # 用于基础任务
+    
+        # 检查数据结构并正确解包
+        # MolTree.tensorize返回格式: 
+        # - product=True: ([graph_batchG], [graph_tensors], None, all_orders)
+        # - product=False: (react_graphs, react_tensors, react_orders)
+        # 我们需要提取张量部分，跳过DiGraph对象
         
-        # 转换为CUDA张量
-        # 注意：张量数据是嵌套结构 [graph_tensors] 或 [[graph_tensors], ...]
-        if isinstance(prod_tensors, list) and len(prod_tensors) > 0:
-            prod_tensors = make_cuda(prod_tensors[0], product=True)
-        else:
-            prod_tensors = make_cuda(prod_tensors, product=True)
-            
-        if isinstance(aug_tensors, list) and len(aug_tensors) > 0:
-            aug_tensors = make_cuda(aug_tensors[0], product=True)
-        else:
-            aug_tensors = make_cuda(aug_tensors, product=True)
-            
-        if isinstance(synthon_tensors, list) and len(synthon_tensors) > 0:
-            synthon_tensors = make_cuda(synthon_tensors[0], product=False)
-        else:
-            synthon_tensors = make_cuda(synthon_tensors, product=False)
-            
-        if isinstance(react_tensors, list) and len(react_tensors) > 0:
-            react_tensors = make_cuda(react_tensors[0], product=False)
-        else:
-            react_tensors = make_cuda(react_tensors, product=False)
+        # 调试：检查张量结构
+        print(f"DEBUG: prod_tensors type: {type(prod_tensors)}")
+        if isinstance(prod_tensors, tuple):
+            print(f"DEBUG: prod_tensors length: {len(prod_tensors)}")
+            for i, item in enumerate(prod_tensors):
+                print(f"DEBUG: prod_tensors[{i}] type: {type(item)}")
+                if isinstance(item, list) and len(item) > 0:
+                    print(f"DEBUG: prod_tensors[{i}][0] type: {type(item[0])}")
         
+        # 创建统一的数据处理函数，确保格式完全对齐
+        def process_tensor_data(raw_tensors, is_product=True):
+            """
+            统一处理张量数据，确保格式与mol_enc.py期望的完全一致
+            
+            Args:
+                raw_tensors: MolTree.tensorize返回的tensor_data部分（4元组）
+                is_product: 是否为产物数据
+            
+            Returns:
+                处理后的张量，格式与mol_enc.py期望的一致
+            """
+            print(f"DEBUG: raw_tensors type: {type(raw_tensors)}")
+            print(f"DEBUG: raw_tensors length: {len(raw_tensors)}")
+            
+            # 步骤1：从MolTree.tensorize的tensor_data中提取图张量
+            if isinstance(raw_tensors, tuple) and len(raw_tensors) == 4:
+                # raw_tensors是tensor_data: ([graph_batchG], [graph_tensors], tree_tensors, all_orders)
+                graph_batchG_list, graph_tensors_list, tree_tensors, all_orders = raw_tensors
+                
+                print(f"DEBUG: graph_tensors_list type: {type(graph_tensors_list)}")
+                print(f"DEBUG: graph_tensors_list length: {len(graph_tensors_list)}")
+                
+                # 提取第一个图的张量（7元组）
+                if isinstance(graph_tensors_list, list) and len(graph_tensors_list) > 0:
+                    graph_tensors = graph_tensors_list[0]  # 这是7元组
+                    print(f"DEBUG: graph_tensors type: {type(graph_tensors)}")
+                    print(f"DEBUG: graph_tensors length: {len(graph_tensors)}")
+                else:
+                    raise ValueError(f"graph_tensors_list格式错误: {type(graph_tensors_list)}")
+            else:
+                raise ValueError(f"raw_tensors格式错误: 期望4元组，得到: {type(raw_tensors)}, 长度: {len(raw_tensors) if hasattr(raw_tensors, '__len__') else 'N/A'}")
+            
+            # 步骤2：验证图张量格式
+            if not isinstance(graph_tensors, (list, tuple)) or len(graph_tensors) != 7:
+                raise ValueError(f"期望7元组图张量，但得到: {type(graph_tensors)}, 长度: {len(graph_tensors) if hasattr(graph_tensors, '__len__') else 'N/A'}")
+            
+            # 步骤3：将张量移动到CUDA并确保正确的数据类型
+            processed_tensors = []
+            for i, tensor in enumerate(graph_tensors):
+                if tensor is None:
+                    processed_tensors.append(None)
+                elif i == 6:  # scope保持原样（通常是列表）
+                    processed_tensors.append(tensor)
+                elif isinstance(tensor, torch.Tensor):
+                    # 确保在正确设备上且为长整型
+                    processed_tensors.append(tensor.to(device).long())
+                else:
+                    # 转换为张量
+                    processed_tensors.append(torch.tensor(tensor, device=device, dtype=torch.long))
+            
+            # 步骤4：验证最终结果
+            if len(processed_tensors) != 7:
+                raise ValueError(f"处理后的张量长度不正确: {len(processed_tensors)}")
+            
+            return processed_tensors
+        
+        # 使用统一函数处理所有数据
+        try:
+            prod_tensors = process_tensor_data(prod_tensors, is_product=True)
+            aug_tensors = process_tensor_data(aug_tensors, is_product=True) 
+            synthon_tensors = process_tensor_data(synthon_tensors, is_product=False)
+            
+            print(f"✓ 数据处理成功 - 产物: {len(prod_tensors)}元组, 增强: {len(aug_tensors)}元组, 合成子: {len(synthon_tensors)}元组")
+            
+        except Exception as e:
+            print(f"❌ 数据处理失败: {e}")
+            # 返回零损失避免训练中断
+            return {
+                'total': torch.tensor(0.0, device=device, requires_grad=True),
+                'center': torch.tensor(0.0, device=device, requires_grad=True),
+                'recovery': torch.tensor(0.0, device=device, requires_grad=True),
+                'contrastive': torch.tensor(0.0, device=device, requires_grad=True)
+            }, {}        
         batch_size = batch['batch_size']
         
         try:
-            print(f"开始三路共享编码（设计方案核心）...")
+            # 按照设计方案：三路共享编码  
+            # 为MolCLR掩码准备MolTree对象
+            product_trees = batch.get('prod_trees', [])
+            augmented_trees = batch.get('aug_trees', [])  # 增强的分子树，包含掩码信息
+            synthon_trees = batch.get('synthon_trees', [])
             
-            # 按照设计方案：三路共享编码
-            # 1. 原始产物图 Gp 输入GMPN编码器 → h_product
-            print("  1. 原始产物图 Gp 输入GMPN编码器 → h_product")
-            h_product, atom_embeds_prod, mess_embeds_prod = self.encode_with_gmpn(prod_tensors)
-            
-            # 2. 增强产物图 Gp_aug 输入GMPN编码器 → h_augmented
-            print("  2. 增强产物图 Gp_aug 输入GMPN编码器 → h_augmented")
-            h_augmented, atom_embeds_aug, mess_embeds_aug = self.encode_with_gmpn(aug_tensors)
-            
-            # 3. 合成子组合 Gs 输入GMPN编码器 → h_synthons
-            print("  3. 合成子组合 Gs 输入GMPN编码器 → h_synthons")
-            h_synthons, atom_embeds_syn, mess_embeds_syn = self.encode_with_gmpn(synthon_tensors)
-            
-            print(f"开始并行计算三个任务（设计方案核心）...")
+            h_product, atom_embeds_prod, mess_embeds_prod = self.encode_with_gmpn(
+                prod_tensors, mol_trees=product_trees)
+            h_augmented, atom_embeds_aug, mess_embeds_aug = self.encode_with_gmpn(
+                aug_tensors, mol_trees=augmented_trees)  # 传递增强的分子树
+            h_synthons, atom_embeds_syn, mess_embeds_syn = self.encode_with_gmpn(
+                synthon_tensors, mol_trees=synthon_trees)
             
             # 按照设计方案：并行计算三个任务
             
             # 任务1：基础任务（反应中心识别）
-            # h_product 被送入基础任务头
-            print("  任务1：基础任务（反应中心识别）")
             try:
                 # 设计方案要求：完全保留G2Retro的反应中心识别机制
                 # 使用真正的G2Retro MolCenter模块进行反应中心识别
@@ -742,27 +517,20 @@ class G2RetroPDesignAlignedModel(nn.Module):
                 product_trees = batch.get('prod_trees', [])
                 
                 # 从产物张量中正确提取所需信息
-                # make_cuda返回的是一个列表，需要先提取内容
-                if isinstance(prod_tensors, list) and len(prod_tensors) > 0:
-                    product_tensors_data = prod_tensors[0]
-                else:
-                    product_tensors_data = prod_tensors
-                    
-                # 现在解包张量数据
-                if len(product_tensors_data) >= 7:
-                    # 完整的张量格式
-                    product_bond_tensors = product_tensors_data[1]  # bond tensor
-                    product_scope_tensors = product_tensors_data[-1]  # scope tensor
-                else:
-                    # 简化格式，可能需要调整
-                    product_bond_tensors = product_tensors_data[1] if len(product_tensors_data) > 1 else None
-                    product_scope_tensors = product_tensors_data[-1] if len(product_tensors_data) > 0 else None
+                # MolTree.tensorize总是返回标准的7个张量：
+                # [atom_tensors, bond_tensors, tree_tensors, word_tensors, 
+                #  mess_dict, local_dict, scope_tensors]
+                product_bond_tensors = prod_tensors[1]   # bond tensor (索引1)
+                product_scope_tensors = prod_tensors[6]  # scope tensor (索引6)
                 
                 # 提取每个样本的完整order信息  
                 product_orders = []
+                valid_order_count = 0
+                
                 for i, pretrain_info in enumerate(batch['pretrain_infos']):
                     if 'product_orders' in pretrain_info and pretrain_info['product_orders'] is not None:
                         product_orders.append(pretrain_info['product_orders'])
+                        valid_order_count += 1
                     else:
                         # 如果没有order信息，从产物树中提取
                         if i < len(product_trees):
@@ -771,11 +539,16 @@ class G2RetroPDesignAlignedModel(nn.Module):
                                 # 从树中提取完整的order信息
                                 bond_order, atom_order, ring_order, change_order = tree.order
                                 product_orders.append((bond_order, atom_order, ring_order, change_order))
+                                valid_order_count += 1
                             else:
-                                # 创建默认的空order信息
+                                # 预训练阶段：创建空order信息作为占位符
+                                # 这样可以让predict_centers正常运行，但不会产生有效的监督信号
                                 product_orders.append(([], [], [], []))
                         else:
                             product_orders.append(([], [], [], []))
+                
+                if valid_order_count < len(product_orders):
+                    print(f"    警告: {len(product_orders)-valid_order_count}/{len(product_orders)} 样本缺少order信息")
                 
                 # 调用G2Retro的反应中心识别（使用完整参数）
                 center_loss, center_acc, num_samples, bond_data, atom_data = self.reaction_center_head.predict_centers(
@@ -788,9 +561,7 @@ class G2RetroPDesignAlignedModel(nn.Module):
                     product_orders           # 产物order信息
                 )
                 
-                print(f"    基础任务损失: {center_loss.item():.4f}")
-                print(f"    基础任务准确率: {center_acc:.4f}")
-                print(f"    处理样本数: {num_samples}")
+                print(f"    Center - Loss: {center_loss.item():.4f}, Acc: {center_acc:.4f}")
                 
                 # 处理bond change和atom charge预测
                 if bond_data[0] is not None and len(bond_data[0]) > 0:
@@ -806,10 +577,7 @@ class G2RetroPDesignAlignedModel(nn.Module):
                     center_loss = center_loss + atom_charge_loss
                 
             except Exception as e:
-                print(f"    基础任务计算错误: {e}")
-                import traceback
-                traceback.print_exc()
-                # 如果完整的反应中心识别失败，返回一个需要梯度的零损失
+                print(f"    基础任务错误: {e}")
                 center_loss = torch.zeros(1, device=device, requires_grad=True).squeeze()
                 center_acc = 0.0
             
@@ -817,8 +585,6 @@ class G2RetroPDesignAlignedModel(nn.Module):
             metrics['center_acc'] = center_acc
             
             # 任务2：分子恢复任务
-            # h_augmented 被送入分子恢复头
-            print("  任务2：分子恢复任务")
             if len(batch['augmented_data']) > 0:
                 # 按照设计方案：h_augmented被送入分子恢复头
                 # 分子恢复任务的目标是从增强的表示恢复原始表示
@@ -828,50 +594,36 @@ class G2RetroPDesignAlignedModel(nn.Module):
                     augmented_data=batch['augmented_data'],
                     pretrain_infos=batch['pretrain_infos']
                 )
-                print(f"    分子恢复损失: {recovery_loss.item():.4f}")
-                print(f"    分子恢复准确率: {recovery_acc:.4f}")
                 losses['recovery'] = recovery_loss
                 metrics['recovery_acc'] = recovery_acc
+                print(f"    Recovery - Loss: {recovery_loss.item():.4f}, Acc: {recovery_acc:.4f}")
             else:
                 losses['recovery'] = torch.tensor(0.0, device=device, requires_grad=True)
                 metrics['recovery_acc'] = 0.0
-                print(f"    分子恢复：无增强数据")
             
             # 任务3：产物-合成子对比学习（核心创新）
-            # h_product 和 h_synthons 被送入产物-合成子对比头
-            print("  任务3：产物-合成子对比学习（核心创新）")
-            
-            # 检查合成子嵌入的维度，如果是3D则需要融合
-            if h_synthons.dim() == 3:
-                # 多合成子情况：[batch_size, num_synthons, hidden_size]
-                print(f"    检测到多合成子：shape={h_synthons.shape}")
-                # 产物-合成子对比头会在内部处理多合成子融合
             
             contrastive_loss, contrastive_acc = self.product_synthon_contrastive_head(
-                h_product,    # 产物表示
-                h_synthons,   # 合成子表示（可能是2D或3D）
+                h_product,    # 产物表示 [batch_size, hidden_size]
+                h_synthons,   # 合成子表示 [batch_size, hidden_size]
                 batch['pretrain_infos']
             )
             
-            print(f"    产物-合成子对比损失: {contrastive_loss.item():.4f}")
-            print(f"    产物-合成子对比准确率: {contrastive_acc:.4f}")
             losses['contrastive'] = contrastive_loss
             metrics['contrastive_acc'] = contrastive_acc
+            print(f"    Contrastive - Loss: {contrastive_loss.item():.4f}, Acc: {contrastive_acc:.4f}")
             
-            # 在损失计算前，动态更新任务权重（基于RetroExplainer的DAMT）
-            print(f"动态调整任务权重（基于RetroExplainer DAMT）...")
+            # 动态更新任务权重（基于RetroExplainer的DAMT）
             self.update_task_weights(losses)
             
-            # 按照设计方案：损失计算，但现在使用动态权重
-            # L_total = w1 × L_base + w2 × L_recovery + w3 × L_contrastive
-            print(f"计算总损失（动态权重）...")
+            # 计算总损失（动态权重）
             total_loss = (
                 self.task_weights[0] * losses['center'] + 
                 self.task_weights[1] * losses['recovery'] + 
                 self.task_weights[2] * losses['contrastive']
             )
-            
-            print(f"  总损失 = {self.task_weights[0]:.4f}×{losses['center'].item():.4f} + {self.task_weights[1]:.4f}×{losses['recovery'].item():.4f} + {self.task_weights[2]:.4f}×{losses['contrastive'].item():.4f} = {total_loss.item():.4f}")
+            print(f"    Total Loss: {total_loss.item():.4f} "
+                  f"[Weights: {self.task_weights[0]:.3f}, {self.task_weights[1]:.3f}, {self.task_weights[2]:.3f}]")
             
             losses['total'] = total_loss
             metrics['task_weights'] = self.task_weights.detach().cpu().numpy()
@@ -993,17 +745,15 @@ class G2RetroPDesignAlignedTrainer:
             
             num_batches += 1
             
-            if batch_idx % 2 == 0:
-                print(f"\nEpoch {epoch}, Batch {batch_idx}/{len(self.train_loader)}")
-                print(f"  总损失: {losses['total'].item():.4f}")
-                print(f"  基础任务损失: {losses['center'].item():.4f}")
-                print(f"  分子恢复损失: {losses['recovery'].item():.4f}")
-                print(f"  产物-合成子对比损失: {losses['contrastive'].item():.4f}")
+            if batch_idx % 5 == 0:
+                print(f"Epoch {epoch}, Batch {batch_idx}/{len(self.train_loader)} - "
+                      f"Loss: {losses['total'].item():.4f} "
+                      f"[Center: {losses['center'].item():.4f}, "
+                      f"Recovery: {losses['recovery'].item():.4f}, "
+                      f"Contrast: {losses['contrastive'].item():.4f}]")
                 if 'task_weights' in metrics:
                     weights = metrics['task_weights']
-                    print(f"  动态任务权重: [基础:{weights[0]:.3f}, 恢复:{weights[1]:.3f}, 对比:{weights[2]:.3f}]")
-                if 'weight_center' in metrics:
-                    print(f"  当前权重详细: 基础={metrics['weight_center']:.4f}, 恢复={metrics['weight_recovery']:.4f}, 对比={metrics['weight_contrastive']:.4f}")
+                    print(f"  权重: [{weights[0]:.3f}, {weights[1]:.3f}, {weights[2]:.3f}]")
         
         # 计算平均值
         if num_batches > 0:
@@ -1082,19 +832,36 @@ class G2RetroPDesignAlignedTrainer:
             # 学习率调度
             self.scheduler.step()
             
-            # 打印统计
-            print(f"\n训练结果（设计方案三任务）:")
+            # 打印详细训练统计
+            print(f"\n{'='*60}")
+            print(f"Epoch {epoch+1} 训练结果汇总:")
+            print(f"{'='*60}")
+            print(f"损失值:")
+            print(f"  中心识别损失: {train_losses.get('center', 0):.4f}")
+            print(f"  分子恢复损失: {train_losses.get('recovery', 0):.4f}")
+            print(f"  对比学习损失: {train_losses.get('contrastive', 0):.4f}")
             print(f"  总损失: {train_losses.get('total', 0):.4f}")
-            print(f"  基础任务准确率: {train_metrics.get('center_acc', 0):.4f}")
+            print(f"准确率:")
+            print(f"  中心识别准确率: {train_metrics.get('center_acc', 0):.4f}")
             print(f"  分子恢复准确率: {train_metrics.get('recovery_acc', 0):.4f}")
-            print(f"  产物-合成子对比准确率: {train_metrics.get('contrastive_acc', 0):.4f}")
+            print(f"  对比学习准确率: {train_metrics.get('contrastive_acc', 0):.4f}")
+            print(f"动态权重:")
+            print(f"  当前权重: [Center: {self.model.task_weights[0]:.3f}, Recovery: {self.model.task_weights[1]:.3f}, Contrastive: {self.model.task_weights[2]:.3f}]")
+            print(f"  权重更新步数: {self.model.weight_update_step}")
             
             if val_losses:
                 print(f"\n验证结果:")
+                print(f"损失值:")
+                print(f"  中心识别损失: {val_losses.get('center', 0):.4f}")
+                print(f"  分子恢复损失: {val_losses.get('recovery', 0):.4f}")
+                print(f"  对比学习损失: {val_losses.get('contrastive', 0):.4f}")
                 print(f"  总损失: {val_losses.get('total', 0):.4f}")
-                print(f"  基础任务准确率: {val_metrics.get('center_acc', 0):.4f}")
+                print(f"准确率:")
+                print(f"  中心识别准确率: {val_metrics.get('center_acc', 0):.4f}")
                 print(f"  分子恢复准确率: {val_metrics.get('recovery_acc', 0):.4f}")
-                print(f"  产物-合成子对比准确率: {val_metrics.get('contrastive_acc', 0):.4f}")
+                print(f"  对比学习准确率: {val_metrics.get('contrastive_acc', 0):.4f}")
+            
+            print(f"{'='*60}\n")
             
             # 保存检查点
             if epoch % 2 == 0:
@@ -1169,6 +936,9 @@ class Args:
         self.loss_queue_length = 50           # 损失队列长度
         self.min_task_weight = 0.01           # 最小任务权重
         self.max_task_weight = 3.0            # 最大任务权重
+        
+        # 数据集参数
+        self.use_small_dataset = False        # 默认使用完整数据集
 
 def main():
     """主函数"""
@@ -1185,15 +955,47 @@ def main():
     # 参数设置
     args = Args()
     
+    # 命令行参数解析
+    if '--small' in sys.argv or '--small-dataset' in sys.argv or '--use_small_dataset' in sys.argv:
+        args.use_small_dataset = True
+        print("🚀 命令行指定使用小数据集模式!")
+    
+    # 解析其他参数
+    for i, arg in enumerate(sys.argv):
+        if arg == '--epochs' and i + 1 < len(sys.argv):
+            args.epochs = int(sys.argv[i + 1])
+            print(f"设置epochs: {args.epochs}")
+        elif arg == '--batch_size' and i + 1 < len(sys.argv):
+            args.batch_size = int(sys.argv[i + 1])
+            print(f"设置batch_size: {args.batch_size}")
+    
+    if '--help' in sys.argv or '-h' in sys.argv:
+        print("\n使用方法:")
+        print("  python train_g2retro_p_design_aligned.py              # 使用完整数据集")
+        print("  python train_g2retro_p_design_aligned.py --small      # 使用小数据集快速测试")
+        print("  python train_g2retro_p_design_aligned.py --use_small_dataset  # 使用小数据集快速测试")
+        print("\n参数说明:")
+        print("  --small, --small-dataset, --use_small_dataset    使用小数据集进行快速测试(1000训练样本+200验证样本)")
+        print("  --epochs N                                       设置训练轮数")
+        print("  --batch_size N                                   设置批次大小")
+        print("  --help, -h                                       显示帮助信息")
+        return
+    
     # 数据路径
     train_data_path = '../data/pretrain/pretrain_tensors_train.pkl'
-    test_data_path = '../data/pretrain/pretrain_tensors_test.pkl'
+    val_data_path = '../data/pretrain/pretrain_tensors_valid.pkl'
     vocab_path = '../data/pretrain/vocab_train.txt'
     
-    # 创建数据集 - 使用小样本进行演示
+    # 创建数据集
     print("\n创建数据集...")
-    train_dataset = G2RetroPDesignAlignedDataset(train_data_path, vocab_path, max_samples=20)
-    val_dataset = G2RetroPDesignAlignedDataset(test_data_path, vocab_path, max_samples=5)
+    if args.use_small_dataset:
+        print("🚀 使用小数据集模式 - 快速测试!")
+        train_dataset = G2RetroPDesignAlignedDataset(train_data_path, vocab_path, max_samples=None, use_small_dataset=True)
+        val_dataset = G2RetroPDesignAlignedDataset(val_data_path, vocab_path, max_samples=None, use_small_dataset=True)
+    else:
+        print("使用完整数据集进行训练")
+        train_dataset = G2RetroPDesignAlignedDataset(train_data_path, vocab_path, max_samples=None)
+        val_dataset = G2RetroPDesignAlignedDataset(val_data_path, vocab_path, max_samples=None)
     
     # 创建数据加载器
     train_loader = DataLoader(

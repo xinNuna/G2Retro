@@ -80,22 +80,12 @@ class ProductSynthonContrastiveHead(nn.Module):
             nn.BatchNorm1d(projection_dim)
         )
         
-        # 合成子融合模块（处理多个合成子的组合）
-        if fusion_method == "attention":
-            self.synthon_attention = nn.MultiheadAttention(
-                embed_dim=projection_dim,
-                num_heads=8,
-                dropout=dropout
-            )
-            # 位置编码（区分不同合成子的位置）
-            self.position_encoding = nn.Parameter(
-                torch.randn(10, projection_dim) * 0.1  # 支持最多10个合成子
-            )
-        elif fusion_method in ["mean", "max"]:
-            # 简单聚合方法不需要额外参数
-            pass
-        else:
+        # G2Retro-P设计：不需要合成子融合模块
+        # 合成子组合已经在数据预处理阶段完成，这里只处理单一的合成子组合分子图
+        # fusion_method参数保留用于兼容性，但实际不使用
+        if fusion_method not in ["attention", "mean", "max"]:
             raise ValueError(f"未支持的融合方法: {fusion_method}")
+        self.fusion_method = fusion_method  # 保存用于日志记录
         
         # 初始化权重
         self._init_weights()
@@ -203,23 +193,12 @@ class ProductSynthonContrastiveHead(nn.Module):
         product_proj = self.product_projector(product_embeddings)  # [batch_size, projection_dim]
         
         # 处理合成子嵌入
-        if synthon_embeddings.dim() == 3:
-            # 多合成子情况：需要先投影每个合成子，然后融合
-            batch_size, num_synthons, synthon_dim = synthon_embeddings.shape
-            
-            # 重塑为2D进行投影
-            synthon_flat = synthon_embeddings.view(-1, synthon_dim)
-            synthon_proj_flat = self.synthon_projector(synthon_flat)
-            
-            # 重塑回3D
-            synthon_proj_3d = synthon_proj_flat.view(batch_size, num_synthons, self.projection_dim)
-            
-            # 融合多个合成子
-            synthon_proj = self.fuse_synthon_embeddings(synthon_proj_3d, synthon_masks)
-            
-        else:
-            # 单合成子或已融合的情况：直接投影
-            synthon_proj = self.synthon_projector(synthon_embeddings)  # [batch_size, projection_dim]
+        # G2Retro-P设计：合成子组合已经在预处理阶段组合为单一分子图
+        # GMPN编码器总是输出2D张量 [batch_size, hidden_size]
+        if synthon_embeddings.dim() != 2:
+            raise ValueError(f"期望合成子嵌入为2D张量 [batch_size, hidden_size]，但得到 {synthon_embeddings.shape}")
+        
+        synthon_proj = self.synthon_projector(synthon_embeddings)  # [batch_size, projection_dim]
         
         # L2归一化（对比学习的标准做法）
         product_proj = F.normalize(product_proj, p=2, dim=1)

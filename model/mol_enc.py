@@ -29,6 +29,12 @@ class MolEncoder(nn.Module):
         self.E_b = feature_embedding[-1-int(self.use_class)]
         self.use_atomic = args.use_atomic
         self.sum_pool = args.sum_pool
+        
+        # MolCLR掩码支持
+        self.mask_token_id = atom_size  # 掩码token的ID，使用词汇表外的索引
+        # 为掩码token创建特殊嵌入
+        self.mask_embedding = nn.Parameter(torch.randn(1, feature_embedding[0].size(1)))
+        nn.init.normal_(self.mask_embedding, 0, 0.1)
                 
         if self.use_feature:
             self.E_fv = feature_embedding[1]
@@ -116,9 +122,52 @@ class MolEncoder(nn.Module):
         
         return hnode, hmess, agraph, bgraph
     
-    def embed_atom_feature(self, fnode, classes=None, charge_set=0, use_feature=False, scopes=None):
+    def embed_atom_feature(self, fnode, classes=None, charge_set=0, use_feature=False, scopes=None, mol_trees=None):
+        """
+        嵌入原子特征，支持MolCLR掩码
+        
+        Args:
+            fnode: 原子特征张量
+            classes: 反应类别
+            charge_set: 电荷偏移
+            use_feature: 是否使用特征
+            scopes: 分子范围
+            mol_trees: MolTree对象列表，用于获取掩码信息
+        """
         if use_feature and self.use_feature:
-            hnode1 = self.E_a.index_select(index=fnode[:, 0], dim=0)
+            # 处理原子类型特征（可能包含掩码）
+            atom_indices = fnode[:, 0].clone()
+            
+            # 应用MolCLR原子掩码
+            if mol_trees is not None:
+                atom_offset = 0
+                for i, tree in enumerate(mol_trees):
+                    if hasattr(tree, 'atom_masks') and tree.atom_masks is not None:
+                        # 获取当前分子的原子范围
+                        if scopes is not None and i < len(scopes):
+                            start_idx = scopes[i][0] 
+                            end_idx = start_idx + scopes[i][1]
+                            
+                            # 应用掩码：将掩码的原子索引替换为掩码token
+                            for local_atom_idx in range(len(tree.atom_masks)):
+                                if local_atom_idx < len(tree.atom_masks) and tree.atom_masks[local_atom_idx]:
+                                    global_atom_idx = start_idx + local_atom_idx
+                                    if global_atom_idx < len(atom_indices):
+                                        atom_indices[global_atom_idx] = self.mask_token_id
+            
+            # 处理掩码token的嵌入
+            mask_positions = (atom_indices == self.mask_token_id)
+            normal_positions = ~mask_positions
+            
+            # 对正常原子进行嵌入
+            normal_atom_indices = atom_indices.clone()
+            normal_atom_indices[mask_positions] = 0  # 临时设置为0避免索引错误
+            
+            hnode1 = self.E_a.index_select(index=normal_atom_indices, dim=0)
+            # 对掩码位置使用特殊的掩码嵌入
+            if mask_positions.any():
+                hnode1[mask_positions] = self.mask_embedding.expand(mask_positions.sum(), -1)
+            
             hnode2 = self.E_fv.index_select(index=fnode[:, 1], dim=0)
             hnode3 = self.E_fg.index_select(index=fnode[:, 2]+charge_set, dim=0)
             hnode4 = self.E_fh.index_select(index=fnode[:, 3], dim=0)
@@ -130,8 +179,36 @@ class MolEncoder(nn.Module):
             else:
                 hnode = torch.cat( (hnode1, hnode2, hnode3, hnode4, hnode5, hnode6), dim=1)
         else:
+            # 简化版本：直接处理原子索引
+            atom_indices = fnode.clone()
+            
+            # 应用MolCLR原子掩码
+            if mol_trees is not None:
+                atom_offset = 0
+                for i, tree in enumerate(mol_trees):
+                    if hasattr(tree, 'atom_masks') and tree.atom_masks is not None:
+                        if scopes is not None and i < len(scopes):
+                            start_idx = scopes[i][0]
+                            end_idx = start_idx + scopes[i][1]
+                            
+                            for local_atom_idx in range(len(tree.atom_masks)):
+                                if local_atom_idx < len(tree.atom_masks) and tree.atom_masks[local_atom_idx]:
+                                    global_atom_idx = start_idx + local_atom_idx  
+                                    if global_atom_idx < len(atom_indices):
+                                        atom_indices[global_atom_idx] = self.mask_token_id
+            
+            # 处理掩码token的嵌入
+            mask_positions = (atom_indices == self.mask_token_id)
+            normal_positions = ~mask_positions
+            
+            normal_atom_indices = atom_indices.clone()
+            normal_atom_indices[mask_positions] = 0  # 临时设置避免索引错误
+            
             try:
-                hnode = self.E_a.index_select(index=fnode, dim=0)
+                hnode = self.E_a.index_select(index=normal_atom_indices, dim=0)
+                # 对掩码位置使用特殊的掩码嵌入
+                if mask_positions.any():
+                    hnode[mask_positions] = self.mask_embedding.expand(mask_positions.sum(), -1)
             except:
                 pdb.set_trace()
         
@@ -161,19 +238,20 @@ class MolEncoder(nn.Module):
         return hmess
 
     
-    def embed_graph(self, graph_tensors, product=False, charge_set=0, usemask=False, use_feature=False, classes=None, subatoms=None):
+    def embed_graph(self, graph_tensors, product=False, charge_set=0, usemask=False, use_feature=False, classes=None, subatoms=None, mol_trees=None):
         """ Prepare the embeddings for graph message passing.
         
         Args:
             graph_tensors: The data of molecular graphs
+            mol_trees: MolTree对象列表，用于MolCLR掩码支持
         
         """
         if len(graph_tensors) == 7:
             fnode, fmess, agraph, bgraph, _, _, scopes = graph_tensors
-            hnode = self.embed_atom_feature(fnode, classes=classes, charge_set=charge_set, use_feature=use_feature, scopes=scopes)
+            hnode = self.embed_atom_feature(fnode, classes=classes, charge_set=charge_set, use_feature=use_feature, scopes=scopes, mol_trees=mol_trees)
         else:
             fnode, fmess, agraph, bgraph, _, _, scopes, atom_mask, bond_mask = graph_tensors
-            hnode = self.embed_atom_feature(fnode, classes=classes, charge_set=charge_set, use_feature=use_feature, scopes=scopes)
+            hnode = self.embed_atom_feature(fnode, classes=classes, charge_set=charge_set, use_feature=use_feature, scopes=scopes, mol_trees=mol_trees)
             if usemask:
                 select_hnode = index_select_ND(hnode, 0, atom_mask.nonzero()[:, 0])
                 agraph = index_select_ND(agraph, 0, atom_mask.nonzero()[:, 0])
@@ -234,12 +312,12 @@ class MolEncoder(nn.Module):
         else:
             return new_vecs, messages
         
-    def forward(self, tensors, subatoms=[], product=False, use_feature=False, classes=None, usemask=False):
+    def forward(self, tensors, subatoms=[], product=False, use_feature=False, classes=None, usemask=False, mol_trees=None):
         if len(tensors) == 3: graph_tensors, tree_tensors, ggraph = tensors
         else: graph_tensors = tensors[0]
         
         if product:
-            tensors1 = self.embed_graph(graph_tensors, product=product, usemask=usemask, use_feature=use_feature, classes=classes)
+            tensors1 = self.embed_graph(graph_tensors, product=product, usemask=usemask, use_feature=use_feature, classes=classes, mol_trees=mol_trees)
             hatom, hmess = self.mpn(*tensors1,False)
             hatom[0,:] = hatom[0,:] * 0
             
@@ -269,7 +347,7 @@ class MolEncoder(nn.Module):
             else:
                 graph_scope = graph_tensors[-1]
         else:
-            tensors = self.embed_graph(graph_tensors, product=product, use_feature=use_feature, usemask=usemask, classes=classes)
+            tensors = self.embed_graph(graph_tensors, product=product, use_feature=use_feature, usemask=usemask, classes=classes, mol_trees=mol_trees)
             hatom, hmess = self.mpn(*tensors, False)
             hatom[0,:] = hatom[0,:] * 0
             
@@ -284,11 +362,11 @@ class MolEncoder(nn.Module):
         embedding = index_select_ND(hatom, 0, mol_indices).sum(dim=1)
         return embedding, hatom, hmess
     
-    def encode_atom(self, graph_tensors, charge_set=0, classes=None, use_feature=False, subatoms=[], usemask=True):
+    def encode_atom(self, graph_tensors, charge_set=0, classes=None, use_feature=False, subatoms=[], usemask=True, mol_trees=None):
         """ return the atom emebeddings learned from MPN given graph tensors
         """
         
-        tensors = self.embed_graph(graph_tensors, product=True, charge_set=charge_set, classes=classes, usemask=usemask, subatoms=subatoms, use_feature=use_feature)
+        tensors = self.embed_graph(graph_tensors, product=True, charge_set=charge_set, classes=classes, usemask=usemask, subatoms=subatoms, use_feature=use_feature, mol_trees=mol_trees)
         hatom, _ = self.mpn(*tensors, False, amask=graph_tensors[-2], bmask=graph_tensors[-1])
         hatom[0,:] = hatom[0,:] * 0
         
